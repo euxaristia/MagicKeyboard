@@ -30,21 +30,49 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Ok(Command::Raw(raw)) => match run_raw(raw) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("{message}");
+                ExitCode::from(1)
+            }
+        },
     }
+}
+
+fn run_raw(raw: RawArgs) -> Result<(), String> {
+    if raw.list {
+        print!("{}", magickeyboard::raw_status()?);
+        if raw.seconds.is_none() {
+            return Ok(());
+        }
+    }
+    magickeyboard::listen_raw(raw.seconds)
 }
 
 enum Command {
     Status,
     Listen(Options),
+    Raw(RawArgs),
     Help,
+}
+
+struct RawArgs {
+    list: bool,
+    seconds: Option<u64>,
 }
 
 const HELP: &str = "\
 magickeyboard status
 magickeyboard listen [--fn-mode MODE] [--swap-opt-cmd [both|left]] [--swap-ctrl-cmd] [--swap-fn-leftctrl] [--iso | --no-iso]
+magickeyboard raw [--list] [--seconds N]
 
 status   print the connected Magic Keyboard and the idle report
 listen   print key, Fn, and consumer events until Ctrl+C
+raw      print Raw Input scan codes and HID reports until Ctrl+C
+--list   print the Apple devices Raw Input can see, then exit
+--seconds N
+         stop raw after N seconds; 0 registers and exits
 
 --fn-mode auto | 3            same as fkeyslast on these keyboards (default)
 --fn-mode fkeyslast | media | 1
@@ -63,11 +91,31 @@ listen   print key, Fn, and consumer events until Ctrl+C
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
     let mut command: Option<Command> = None;
     let mut options = Options::default();
+    let mut raw_list = false;
+    let mut raw_seconds: Option<u64> = None;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "status" => set_command(&mut command, Command::Status)?,
             "listen" => set_command(&mut command, Command::Listen(options))?,
+            "raw" => set_command(
+                &mut command,
+                Command::Raw(RawArgs {
+                    list: false,
+                    seconds: None,
+                }),
+            )?,
+            "--list" => raw_list = true,
+            "--seconds" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing value for --seconds".to_string())?;
+                raw_seconds = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("unknown seconds {value}"))?,
+                );
+            }
             "help" | "--help" | "-h" => return Ok(Command::Help),
             "--swap-opt-cmd" => {
                 options.swap_opt_cmd = match args.peek().map(String::as_str) {
@@ -98,12 +146,20 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
     if matches!(command, Some(Command::Listen(_))) {
         command = Some(Command::Listen(options));
     }
+    if matches!(command, Some(Command::Raw(_))) {
+        command = Some(Command::Raw(RawArgs {
+            list: raw_list,
+            seconds: raw_seconds,
+        }));
+    } else if raw_list || raw_seconds.is_some() {
+        return Err(format!("--list and --seconds belong to raw\n{HELP}"));
+    }
     Ok(command.unwrap_or(Command::Status))
 }
 
 fn set_command(slot: &mut Option<Command>, command: Command) -> Result<(), String> {
     if slot.is_some() {
-        return Err("pass either status or listen".to_string());
+        return Err("pass one of status, listen, or raw".to_string());
     }
     *slot = Some(command);
     Ok(())
@@ -157,5 +213,19 @@ mod tests {
         };
         assert_eq!(options.fn_mode, FnMode::FkeysLast);
         assert_eq!(options.swap_opt_cmd, SwapOptCmd::Off);
+    }
+
+    #[test]
+    fn raw_list_does_not_listen() {
+        let Command::Raw(raw) = parse_args(
+            ["--seconds", "0", "raw", "--list"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap() else {
+            panic!("raw");
+        };
+        assert!(raw.list);
+        assert_eq!(raw.seconds, Some(0));
     }
 }

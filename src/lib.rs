@@ -12,7 +12,11 @@ pub use report::{parse_keyboard, parse_report, InputReport, KeyboardReport};
 pub use session::{Action, Edge, FnMode, Iso, Options, Session, SwapOptCmd};
 
 #[cfg(windows)]
+mod rawinput;
+#[cfg(windows)]
 mod winhid;
 
+#[cfg(windows)]
+pub use rawinput::{listen_raw, raw_status};
 #[cfg(windows)]
 pub use winhid::{listen, status};

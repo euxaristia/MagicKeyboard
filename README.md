@@ -18,7 +18,11 @@ Touch ID only authenticates to a paired Mac. This program does not drive it. Int
 cargo run -- status
 cargo run -- listen
 cargo run -- listen --fn-mode fkeysfirst --swap-opt-cmd
+cargo run -- raw --list
+cargo run -- raw
 ```
+
+`raw` uses Raw Input. The boot keyboard arrives as scan codes. Other collections arrive as HID reports when Windows exposes them that way. Scan codes do not include the Fn bit in byte 9.
 
 `--fn-mode` accepts the Linux values:
 
