@@ -22,7 +22,7 @@ cargo run -- raw --list
 cargo run -- raw
 ```
 
-`raw` uses Raw Input. The boot keyboard arrives as scan codes. Other collections arrive as HID reports when Windows exposes them that way. Scan codes do not include the Fn bit in byte 9.
+`listen` and `raw` share one translator. Keyboard report 1 goes through the Fn map. Consumer and system reports are printed as down and up edges. The boot collection is owned by the inbox keyboard driver, so `listen` also prints its Raw Input scan codes by name. Those scan codes are not Fn-translated: the Fn bit is not in them. `raw` accepts the same Fn and swap flags. Neither command injects keys back into Windows.
 
 `--fn-mode` accepts the Linux values:
 

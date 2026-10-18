@@ -5,11 +5,16 @@
 //! codes. Other top-level collections arrive as HID reports when Windows
 //! exposes them.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
 use crate::model::identify;
-use crate::report::parse_report;
-use crate::report::InputReport;
+use crate::present::Translator;
+use crate::report::{parse_report, InputReport};
+use crate::scancode::format_scan;
+use crate::session::Options;
 
 const RIM_TYPEKEYBOARD: u32 = 1;
 const RIM_TYPEHID: u32 = 2;
@@ -24,10 +29,6 @@ const WM_QUIT: u32 = 0x0012;
 const WM_STOP: u32 = 0x8000;
 const PM_REMOVE: u32 = 0x0001;
 const QS_ALLINPUT: u32 = 0x04FF;
-const RI_KEY_BREAK: u16 = 0x0001;
-const RI_KEY_E0: u16 = 0x0002;
-const RI_KEY_E1: u16 = 0x0004;
-
 static RAW_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 #[repr(C)]
@@ -164,40 +165,13 @@ pub fn format_raw_list(apple: &[RawDevice], total: usize) -> String {
     out
 }
 
-pub fn format_input(
-    kind: u32,
-    product: u16,
-    usage_page: u16,
-    usage: u16,
-    data: &[u8],
-) -> Option<String> {
-    match kind {
-        RIM_TYPEKEYBOARD => format_keyboard(product, data),
-        RIM_TYPEHID => Some(format_hid(product, usage_page, usage, data)),
-        _ => None,
-    }
-}
-
 fn format_keyboard(product: u16, data: &[u8]) -> Option<String> {
     if data.len() < 8 {
         return None;
     }
     let make = u16::from_le_bytes([data[0], data[1]]);
     let flags = u16::from_le_bytes([data[2], data[3]]);
-    let vkey = u16::from_le_bytes([data[6], data[7]]);
-    let edge = if flags & RI_KEY_BREAK == 0 {
-        "down"
-    } else {
-        "up"
-    };
-    let mut line = format!("key {edge} product {product:04x} make {make:04x} vkey {vkey:04x}");
-    if flags & RI_KEY_E0 != 0 {
-        line.push_str(" e0");
-    }
-    if flags & RI_KEY_E1 != 0 {
-        line.push_str(" e1");
-    }
-    Some(line)
+    Some(format_scan(product, make, flags))
 }
 
 fn format_hid(product: u16, usage_page: u16, usage: u16, data: &[u8]) -> String {
@@ -246,14 +220,29 @@ pub fn raw_status() -> Result<String, String> {
     Ok(format_raw_list(&apple, total))
 }
 
-pub fn listen_raw(seconds: Option<u64>) -> Result<(), String> {
+pub fn listen_raw(seconds: Option<u64>, options: &Options) -> Result<(), String> {
     let (apple, total) = apple_devices()?;
     print!("{}", format_raw_list(&apple, total));
-    let window = RawWindow::open()?;
+    let window = RawWindow::open(true)?;
     window.register()?;
     println!("raw input registered, Ctrl+C to stop");
-    window.pump(&apple, seconds)?;
+    window.pump(&apple, seconds, options, None)?;
     Ok(())
+}
+
+/// Names keys from the boot collection while `listen` reads the other reports.
+pub fn watch_scan_codes(tx: mpsc::Sender<String>) {
+    thread::spawn(move || {
+        let result = (|| {
+            let (apple, _) = apple_devices()?;
+            let window = RawWindow::open(false)?;
+            window.register()?;
+            window.pump(&apple, None, &Options::default(), Some(&tx))
+        })();
+        if let Err(message) = result {
+            let _ = tx.send(message);
+        }
+    });
 }
 
 fn apple_devices() -> Result<(Vec<RawDevice>, usize), String> {
@@ -389,7 +378,7 @@ struct RawWindow {
 }
 
 impl RawWindow {
-    fn open() -> Result<Self, String> {
+    fn open(stop_on_ctrl: bool) -> Result<Self, String> {
         let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
         if instance.is_null() {
             return Err(format!("module handle failed ({})", last_error()));
@@ -439,7 +428,9 @@ impl RawWindow {
             return Err(format!("raw window failed ({})", last_error()));
         }
         RAW_HWND.store(hwnd, Ordering::Release);
-        unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), 1) };
+        if stop_on_ctrl {
+            unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), 1) };
+        }
         Ok(Self {
             hwnd,
             class: window.class.clone(),
@@ -493,12 +484,19 @@ impl RawWindow {
         Ok(())
     }
 
-    fn pump(&self, apple: &[RawDevice], seconds: Option<u64>) -> Result<(), String> {
+    fn pump(
+        &self,
+        apple: &[RawDevice],
+        seconds: Option<u64>,
+        options: &Options,
+        tx: Option<&mpsc::Sender<String>>,
+    ) -> Result<(), String> {
         let deadline =
             seconds.map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs));
         if seconds == Some(0) {
             return Ok(());
         }
+        let mut translators: BTreeMap<u16, Translator> = BTreeMap::new();
         loop {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 return Ok(());
@@ -522,8 +520,13 @@ impl RawWindow {
                 return Ok(());
             }
             if msg.message == WM_INPUT {
-                if let Some(line) = event_line(msg.lparam, apple) {
-                    println!("{line}");
+                for line in event_lines(msg.lparam, apple, options, &mut translators, tx.is_some())
+                {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(line);
+                    } else {
+                        println!("{line}");
+                    }
                 }
                 continue;
             }
@@ -588,18 +591,34 @@ impl Drop for RawWindow {
     }
 }
 
-fn event_line(handle: isize, apple: &[RawDevice]) -> Option<String> {
-    let bytes = read_input(handle).ok()?;
+fn event_lines(
+    handle: isize,
+    apple: &[RawDevice],
+    options: &Options,
+    translators: &mut BTreeMap<u16, Translator>,
+    scans_only: bool,
+) -> Vec<String> {
+    let Ok(bytes) = read_input(handle) else {
+        return Vec::new();
+    };
     if bytes.len() < std::mem::size_of::<Header>() {
-        return None;
+        return Vec::new();
     }
-    let kind = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let Some(kind_bytes) = bytes.get(..4) else {
+        return Vec::new();
+    };
+    let Ok(kind_bytes) = kind_bytes.try_into() else {
+        return Vec::new();
+    };
+    let kind = u32::from_le_bytes(kind_bytes);
     let device_at = std::mem::offset_of!(Header, device);
-    let device = usize::from_le_bytes(
-        bytes[device_at..device_at + std::mem::size_of::<usize>()]
-            .try_into()
-            .ok()?,
-    );
+    let Some(device_bytes) = bytes.get(device_at..device_at + std::mem::size_of::<usize>()) else {
+        return Vec::new();
+    };
+    let Ok(device_bytes) = device_bytes.try_into() else {
+        return Vec::new();
+    };
+    let device = usize::from_le_bytes(device_bytes);
     let matched = apple.iter().find(|item| item.handle == device);
     let name = device_name(device as *mut std::ffi::c_void);
     let (vendor, product) = parse_hid_ids(&name).unwrap_or((0, 0));
@@ -614,17 +633,84 @@ fn event_line(handle: isize, apple: &[RawDevice]) -> Option<String> {
         matched.map(|item| item.vendor).unwrap_or(0)
     };
     if !apple_device(vendor, product) {
-        return None;
+        return Vec::new();
+    }
+    let data = &bytes[std::mem::size_of::<Header>()..];
+    if kind == RIM_TYPEKEYBOARD {
+        return format_keyboard(product, data).into_iter().collect();
+    }
+    if scans_only || kind != RIM_TYPEHID {
+        return Vec::new();
     }
     let usage_page = matched.map(|item| item.usage_page).unwrap_or(0);
     let usage = matched.map(|item| item.usage).unwrap_or(0);
-    format_input(
-        kind,
+    translate_hid(
+        vendor,
         product,
         usage_page,
         usage,
-        &bytes[std::mem::size_of::<Header>()..],
+        data,
+        options,
+        translators,
     )
+}
+
+fn translate_hid(
+    vendor: u16,
+    product: u16,
+    usage_page: u16,
+    usage: u16,
+    data: &[u8],
+    options: &Options,
+    translators: &mut BTreeMap<u16, Translator>,
+) -> Vec<String> {
+    let Some(bytes) = hid_bytes(data) else {
+        return vec![format_hid(product, usage_page, usage, data)];
+    };
+    let Some(report) = parse_report(bytes) else {
+        return vec![format!(
+            "hid product {product:04x} usage {usage_page:04x}:{usage:04x} {}",
+            hex_bytes(bytes)
+        )];
+    };
+    let Some(translator) = translator_for(translators, vendor, product, options) else {
+        return vec![format!(
+            "hid product {product:04x} usage {usage_page:04x}:{usage:04x} {}",
+            hex_bytes(bytes)
+        )];
+    };
+    translator
+        .push(&report)
+        .into_iter()
+        .map(|line| format!("{product:04x} {line}"))
+        .collect()
+}
+
+fn translator_for<'a>(
+    translators: &'a mut BTreeMap<u16, Translator>,
+    vendor: u16,
+    product: u16,
+    options: &Options,
+) -> Option<&'a mut Translator> {
+    if translators.contains_key(&product) {
+        return translators.get_mut(&product);
+    }
+    let model = identify(vendor, product)?;
+    translators.insert(
+        product,
+        Translator::new(model.map, model.iso_quirk, *options),
+    );
+    translators.get_mut(&product)
+}
+
+fn hid_bytes(data: &[u8]) -> Option<&[u8]> {
+    if data.len() < 8 {
+        return None;
+    }
+    let size = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    let count = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
+    let take = size.saturating_mul(count).min(data.len().saturating_sub(8));
+    Some(&data[8..8 + take])
 }
 
 fn read_input(handle: isize) -> Result<Vec<u8>, u32> {
@@ -780,15 +866,23 @@ mod tests {
     #[test]
     fn keyboard_events_are_scan_codes_and_hid_events_keep_fn() {
         let down = [0x1E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0, 0, 0, 0];
-        assert_eq!(
-            format_input(RIM_TYPEKEYBOARD, 0x0321, 0, 0, &down).unwrap(),
-            "key down product 0321 make 001e vkey 0041"
-        );
+        assert_eq!(format_keyboard(0x0321, &down).unwrap(), "scan 0321 down A");
         let mut hid = vec![10u8, 0, 0, 0, 1, 0, 0, 0];
-        hid.extend_from_slice(&[0x01, 0x00, 0x00, 0x04, 0, 0, 0, 0, 0, 0x02]);
-        let line = format_input(RIM_TYPEHID, 0x0321, 0x0001, 0x0006, &hid).unwrap();
-        assert!(line.contains("01 00 00 04 00 00 00 00 00 02"));
-        assert!(line.contains("fn down"));
+        hid.extend_from_slice(&[0x01, 0x00, 0x00, 0x3A, 0, 0, 0, 0, 0, 0x02]);
+        let mut translators = BTreeMap::new();
+        let lines = translate_hid(
+            0x05AC,
+            0x0321,
+            0x0001,
+            0x0006,
+            &hid,
+            &Options::default(),
+            &mut translators,
+        );
+        assert_eq!(
+            lines,
+            vec!["0321 down fn".to_string(), "0321 down F1".to_string()]
+        );
     }
 
     #[test]

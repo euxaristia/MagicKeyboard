@@ -47,7 +47,7 @@ fn run_raw(raw: RawArgs) -> Result<(), String> {
             return Ok(());
         }
     }
-    magickeyboard::listen_raw(raw.seconds)
+    magickeyboard::listen_raw(raw.seconds, &raw.options)
 }
 
 enum Command {
@@ -60,6 +60,7 @@ enum Command {
 struct RawArgs {
     list: bool,
     seconds: Option<u64>,
+    options: Options,
 }
 
 const HELP: &str = "\
@@ -68,8 +69,8 @@ magickeyboard listen [--fn-mode MODE] [--swap-opt-cmd [both|left]] [--swap-ctrl-
 magickeyboard raw [--list] [--seconds N]
 
 status   print the connected Magic Keyboard and the idle report
-listen   print key, Fn, and consumer events until Ctrl+C
-raw      print Raw Input scan codes and HID reports until Ctrl+C
+listen   translate HID reports, and name inbox scan codes, until Ctrl+C
+raw      same translation for Raw Input HID reports; scan codes are named only
 --list   print the Apple devices Raw Input can see, then exit
 --seconds N
          stop raw after N seconds; 0 registers and exits
@@ -103,6 +104,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
                 Command::Raw(RawArgs {
                     list: false,
                     seconds: None,
+                    options: Options::default(),
                 }),
             )?,
             "--list" => raw_list = true,
@@ -150,6 +152,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
         command = Some(Command::Raw(RawArgs {
             list: raw_list,
             seconds: raw_seconds,
+            options,
         }));
     } else if raw_list || raw_seconds.is_some() {
         return Err(format!("--list and --seconds belong to raw\n{HELP}"));

@@ -3,10 +3,9 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::model::identify;
-use crate::names::consumer_name;
-use crate::present::{edge_line, format_status, CollectionView, DeviceView};
+use crate::present::{format_status, CollectionView, DeviceView, Translator};
 use crate::report::{parse_report, InputReport};
-use crate::session::{Options, Session};
+use crate::session::Options;
 
 #[repr(C)]
 struct Guid {
@@ -192,12 +191,14 @@ pub fn listen(options: &Options) -> Result<(), String> {
         let len = node.input_len;
         let map = model.map;
         let iso_quirk = model.iso_quirk;
-        thread::spawn(move || read_loop(path, len, tx, kind, map, iso_quirk, options));
+        let product = model.product;
+        thread::spawn(move || read_loop(path, len, tx, kind, map, iso_quirk, product, options));
     }
-    drop(tx);
     if readers == 0 {
         return Err("no readable HID collection".to_string());
     }
+    crate::rawinput::watch_scan_codes(tx.clone());
+    drop(tx);
     println!("listening, Ctrl+C to stop");
     for line in rx {
         println!("{line}");
@@ -240,6 +241,7 @@ fn read_loop(
     kind: Kind,
     map: crate::model::MapKind,
     iso_quirk: bool,
+    product: u16,
     options: Options,
 ) {
     let handle = match open_hid(&path) {
@@ -251,7 +253,7 @@ fn read_loop(
     };
     // Country stays unknown: the inbox keyboard driver owns the boot collection.
     // Auto ISO swap needs country 13, so grave is left alone unless --iso is set.
-    let mut session = Session::new(map, iso_quirk, None, options);
+    let mut translator = Translator::new(map, iso_quirk, options);
     let mut buffer = vec![0u8; usize::from(input_len)];
     loop {
         let mut got = 0u32;
@@ -278,24 +280,9 @@ fn read_loop(
             return;
         }
         let bytes = &buffer[..got as usize];
-        match kind {
-            Kind::Keyboard => {
-                if let Some(InputReport::Keyboard(report)) = parse_report(bytes) {
-                    for edge in session.push_keyboard(&report) {
-                        let _ = tx.send(edge_line(&edge.action, edge.down));
-                    }
-                }
-            }
-            Kind::Consumer => {
-                if let Some(InputReport::Consumer(report)) = parse_report(bytes) {
-                    let _ = tx.send(consumer_name(report.usage));
-                }
-            }
-            Kind::System => {
-                if let Some(InputReport::System(report)) = parse_report(bytes) {
-                    let dir = if report.sleep { "down" } else { "up" };
-                    let _ = tx.send(format!("{dir} sleep"));
-                }
+        if let Some(report) = parse_report(bytes) {
+            for line in translator.push(&report) {
+                let _ = tx.send(format!("{product:04x} {line}"));
             }
         }
     }

@@ -1,7 +1,7 @@
-use crate::model::{identify, measured_interfaces};
-use crate::names::label;
+use crate::model::{identify, measured_interfaces, MapKind};
+use crate::names::{consumer_name, label};
 use crate::report::InputReport;
-use crate::session::Action;
+use crate::session::{Action, Options, Session};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionView {
@@ -107,6 +107,60 @@ pub fn edge_line(action: &Action, down: bool) -> String {
     format!("{dir} {}", label(action))
 }
 
+/// Keyboard, consumer, and system reports in one place. Keyboard reports go
+/// through the Fn map. Consumer and system reports become down and up edges.
+pub struct Translator {
+    session: Session,
+    consumer: u16,
+    sleep: bool,
+}
+
+impl Translator {
+    pub fn new(map: MapKind, iso_quirk: bool, options: Options) -> Self {
+        Self {
+            session: Session::new(map, iso_quirk, None, options),
+            consumer: 0,
+            sleep: false,
+        }
+    }
+
+    pub fn push(&mut self, report: &InputReport) -> Vec<String> {
+        match report {
+            InputReport::Keyboard(report) => self
+                .session
+                .push_keyboard(report)
+                .iter()
+                .map(|edge| edge_line(&edge.action, edge.down))
+                .collect(),
+            InputReport::Consumer(report) => self.push_consumer(report.usage),
+            InputReport::System(report) => self.push_sleep(report.sleep),
+        }
+    }
+
+    fn push_consumer(&mut self, usage: u16) -> Vec<String> {
+        if usage == self.consumer {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        if self.consumer != 0 {
+            lines.push(format!("up {}", consumer_name(self.consumer)));
+        }
+        self.consumer = usage;
+        if usage != 0 {
+            lines.push(format!("down {}", consumer_name(usage)));
+        }
+        lines
+    }
+
+    fn push_sleep(&mut self, sleep: bool) -> Vec<String> {
+        if sleep == self.sleep {
+            return Vec::new();
+        }
+        self.sleep = sleep;
+        vec![edge_line(&Action::Sleep, sleep)]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +189,40 @@ mod tests {
         assert!(text.contains("idle: fn up, eject up"));
         assert!(text.contains("not driven"));
         assert!(text.contains("battery is on usb interface 0"));
+    }
+
+    #[test]
+    fn one_translator_covers_keyboard_consumer_and_sleep() {
+        use crate::report::{parse_consumer, parse_keyboard, parse_system};
+        use crate::session::FnMode;
+
+        let mut translator = Translator::new(
+            MapKind::Magic2021,
+            true,
+            Options {
+                fn_mode: FnMode::FkeysLast,
+                ..Options::default()
+            },
+        );
+        let keyboard = parse_keyboard(&[0x01, 0, 0, 0x3A, 0, 0, 0, 0, 0, 0x02]).unwrap();
+        assert_eq!(
+            translator.push(&InputReport::Keyboard(keyboard)),
+            vec!["down fn".to_string(), "down F1".to_string()]
+        );
+        let volume = parse_consumer(&[0x03, 0xE9, 0x00]).unwrap();
+        assert_eq!(
+            translator.push(&InputReport::Consumer(volume)),
+            vec!["down volume up".to_string()]
+        );
+        let release = parse_consumer(&[0x03, 0x00, 0x00]).unwrap();
+        assert_eq!(
+            translator.push(&InputReport::Consumer(release)),
+            vec!["up volume up".to_string()]
+        );
+        let sleep = parse_system(&[0x04, 0x01]).unwrap();
+        assert_eq!(
+            translator.push(&InputReport::System(sleep)),
+            vec!["down sleep".to_string()]
+        );
     }
 }
