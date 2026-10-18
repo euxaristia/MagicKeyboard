@@ -42,3 +42,19 @@ cargo run -- drive
 `--iso` always swaps grave and the non-US key. `--no-iso` never does. The default swaps only when the model has the ISO quirk and the HID country code is 13. Every Magic Keyboard from 2015 on has the quirk, and so do the aluminum wireless ISO models. The inbox keyboard driver owns the boot collection, so this program does not see the country code and the default leaves grave alone.
 
 `fix_magic_keyboard_descriptor` rewrites two descriptor shapes: the Magic Keyboard JIS logical maximum, and the 83-byte battery collection. It is not applied to the live 2024 device.
+
+## License
+
+Copyright © 2026 euxaristia
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
