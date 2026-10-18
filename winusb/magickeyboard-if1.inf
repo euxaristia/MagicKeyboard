@@ -1,0 +1,42 @@
+;
+; Binds the inbox WinUSB driver to Magic Keyboard interface 1.
+; Matches the 2024 Touch ID keyboard only: USB\VID_05AC&PID_0321&MI_01.
+; Interface 0, interface 2, and every other product stay on their own drivers.
+;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = USBDevice
+ClassGUID   = {88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+Provider    = %ProviderName%
+CatalogFile = magickeyboard-if1.cat
+DriverVer   = 10/18/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName% = USB_Install, USB\VID_05AC&PID_0321&REV_0520&MI_01
+%DeviceName% = USB_Install, USB\VID_05AC&PID_0321&MI_01
+
+[USB_Install.NT]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.NT.HW]
+Include = winusb.inf
+Needs   = WINUSB.NT.HW
+AddReg  = Dev_AddReg
+
+[USB_Install.NT.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[Dev_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{7e89c8ac-3368-4e78-8cf7-303666fa4fcb}"
+
+[Strings]
+ProviderName     = "Magic Keyboard"
+ManufacturerName = "Magic Keyboard"
+DeviceName       = "Magic Keyboard interface 1"

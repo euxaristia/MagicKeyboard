@@ -1,9 +1,11 @@
 //! Read interface 1 through WinUSB and inject translated edges.
+//! Held keys repeat here: Windows typematic does not run for SendInput.
 //!
 //! Enumeration only looks at the service name. `drive` returns before
 //! CreateFile, and before any injected key, when that service is not WinUSB.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use crate::inject::{event_fields, injection, Injection, Stroke};
 use crate::model::{identify, MapKind};
@@ -18,14 +20,18 @@ const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const FILE_SHARE_READ_WRITE: u32 = 3;
 const OPEN_EXISTING: u32 = 3;
+const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 const SPDRP_SERVICE: u32 = 4;
-const DICS_FLAG_GLOBAL: u32 = 1;
-const DIREG_DEV: u32 = 1;
 const KEY_READ: u32 = 0x20019;
+const HKEY_LOCAL_MACHINE: isize = 0x80000002u32 as i32 as isize;
 const PIPE_TRANSFER_TIMEOUT: u32 = 0x03;
 const USBD_PIPE_INTERRUPT: u32 = 3;
 const ERROR_SEM_TIMEOUT: u32 = 121;
 const WAIT_TIMEOUT: u32 = 258;
+const IDLE_POLL_MS: u32 = 200;
+const REPEAT_POLL_MS: u32 = 10;
+const SPI_GETKEYBOARDSPEED: u32 = 0x000A;
+const SPI_GETKEYBOARDDELAY: u32 = 0x0016;
 const INPUT_KEYBOARD: u32 = 1;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -196,11 +202,77 @@ struct Held {
 
 impl Held {
     fn remove_one(&mut self, stroke: &Stroke) {
-        if let Some(index) = self.keys.iter().position(|(_, held)| {
-            held.kind == stroke.kind && held.code == stroke.code && held.extended == stroke.extended
-        }) {
+        if let Some(index) = self
+            .keys
+            .iter()
+            .position(|(_, held)| same_stroke(held, stroke))
+        {
             self.keys.remove(index);
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Typematic {
+    delay_ms: u64,
+    interval_ms: u64,
+}
+
+struct RepeatKey {
+    stroke: Stroke,
+    started: Instant,
+    sent: u32,
+}
+
+struct Repeater {
+    rate: Typematic,
+    keys: Vec<RepeatKey>,
+}
+
+impl Repeater {
+    fn new(rate: Typematic) -> Self {
+        Self {
+            rate,
+            keys: Vec::new(),
+        }
+    }
+
+    fn arm(&mut self, action: Action, stroke: Stroke) {
+        if !typematic_action(action)
+            || self
+                .keys
+                .iter()
+                .any(|key| same_stroke(&key.stroke, &stroke))
+        {
+            return;
+        }
+        self.keys.push(RepeatKey {
+            stroke,
+            started: Instant::now(),
+            sent: 0,
+        });
+    }
+
+    fn disarm(&mut self, stroke: &Stroke) {
+        self.keys.retain(|key| !same_stroke(&key.stroke, stroke));
+    }
+
+    fn armed(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
+    fn pump(&mut self, now: Instant) -> Vec<Stroke> {
+        let mut out = Vec::new();
+        for key in &mut self.keys {
+            let elapsed = now.duration_since(key.started).as_millis() as u64;
+            let Some(sent) = advance_repeat(elapsed, key.sent, self.rate) else {
+                continue;
+            };
+            // A late wake emits one repeat and drops the missed ones.
+            key.sent = sent;
+            out.push(key.stroke);
+        }
+        out
     }
 }
 
@@ -234,11 +306,11 @@ fn open_winusb_keyboard() -> Result<Opened, String> {
         .ok_or_else(|| "no Magic Keyboard interface 1 found".to_string())?;
     let model = identify(vendor, product)
         .ok_or_else(|| "no Magic Keyboard interface 1 found".to_string())?;
-    let path = device_path(set.0, &selected.instance)?;
+    let path = device_path(&selected.instance)?;
     let handle = open_device(&path)?;
     let usb = start_winusb(&handle)?;
     let pipe = interrupt_pipe(&usb)?;
-    set_timeout(&usb, pipe.id)?;
+    set_timeout(&usb, pipe.id, IDLE_POLL_MS)?;
     Ok(Opened {
         product: model.product,
         map: model.map,
@@ -264,6 +336,8 @@ fn read_loop(opened: Opened, options: &Options) -> Result<(), String> {
     // WinUsb_ReadPipe needs the CreateFile handle kept open.
     let _device = &opened.handle;
     let mut translator = Translator::new(opened.map, opened.iso_quirk, *options);
+    let mut repeater = Repeater::new(system_typematic());
+    let mut fast_poll = false;
     println!("driving {:04x}, Ctrl+C to stop", opened.product);
     let mut buffer = vec![0u8; buffer_len(opened.packet)];
     loop {
@@ -286,24 +360,38 @@ fn read_loop(opened: Opened, options: &Options) -> Result<(), String> {
         }
         if ok == 0 {
             let err = last_error();
-            if err == ERROR_SEM_TIMEOUT || err == WAIT_TIMEOUT {
-                continue;
+            if err != ERROR_SEM_TIMEOUT && err != WAIT_TIMEOUT {
+                return Err(format!("read ended ({err})"));
             }
-            return Err(format!("read ended ({err})"));
+        } else if got > 0 {
+            if let Some(report) = parse_report(&buffer[..got as usize]) {
+                for step in translator.steps(&report) {
+                    apply(opened.product, &step, &mut held, &mut repeater);
+                }
+            }
         }
-        if got == 0 {
-            continue;
+        for stroke in repeater.pump(Instant::now()) {
+            let _ = send_stroke(&stroke);
         }
-        let Some(report) = parse_report(&buffer[..got as usize]) else {
-            continue;
-        };
-        for step in translator.steps(&report) {
-            apply(opened.product, &step, &mut held);
+        let want_fast = repeater.armed();
+        if want_fast != fast_poll
+            && set_timeout(
+                &opened.usb,
+                opened.pipe_id,
+                if want_fast {
+                    REPEAT_POLL_MS
+                } else {
+                    IDLE_POLL_MS
+                },
+            )
+            .is_ok()
+        {
+            fast_poll = want_fast;
         }
     }
 }
 
-fn apply(product: u16, step: &Step, held: &mut Held) {
+fn apply(product: u16, step: &Step, held: &mut Held, repeater: &mut Repeater) {
     match step {
         Step::Edge(edge) => match injection(edge.action, edge.down) {
             Injection::Skip => {}
@@ -318,8 +406,10 @@ fn apply(product: u16, step: &Step, held: &mut Held) {
                     println!("{product:04x} {}", edge_line(&edge.action, edge.down));
                     if stroke.down {
                         held.keys.push((edge.action, stroke));
+                        repeater.arm(edge.action, stroke);
                     } else {
                         held.remove_one(&stroke);
+                        repeater.disarm(&stroke);
                     }
                 }
                 Err(err) => eprintln!("{product:04x} inject failed ({err})"),
@@ -491,9 +581,8 @@ fn list_interfaces(set: isize) -> Result<Vec<UsbNode>, String> {
     Ok(nodes)
 }
 
-fn device_path(set: isize, instance: &str) -> Result<String, String> {
-    let mut dev = find_dev(set, instance)?;
-    let guids = interface_guids(set, &mut dev)?;
+fn device_path(instance: &str) -> Result<String, String> {
+    let guids = interface_guids(instance)?;
     if guids.is_empty() {
         return Err("interface 1 has no WinUSB device interface".to_string());
     }
@@ -507,34 +596,17 @@ fn device_path(set: isize, instance: &str) -> Result<String, String> {
     Err(missed)
 }
 
-fn find_dev(set: isize, instance: &str) -> Result<DevInfoData, String> {
-    let mut index = 0u32;
-    loop {
-        let mut dev = empty_dev();
-        let ok = unsafe { SetupDiEnumDeviceInfo(set, index, &mut dev) };
-        if ok == 0 {
-            break;
-        }
-        index += 1;
-        if device_instance_id(set, &mut dev).is_some_and(|id| id.eq_ignore_ascii_case(instance)) {
-            return Ok(dev);
-        }
-    }
-    Err("interface 1 disappeared before it could be opened".to_string())
+fn parameters_key(instance: &str) -> String {
+    format!(r"SYSTEM\CurrentControlSet\Enum\{instance}\Device Parameters")
 }
 
-fn interface_guids(set: isize, dev: &mut DevInfoData) -> Result<Vec<Guid>, String> {
-    let hw = unsafe { SetupDiOpenDevRegKey(set, dev, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ) };
-    if hw == 0 || hw == -1 {
-        return Err(format!(
-            "interface 1 has no WinUSB device interface ({})",
-            last_error()
-        ));
-    }
-    let hw = RegKey(hw);
+fn interface_guids(instance: &str) -> Result<Vec<Guid>, String> {
+    // The interface GUID is on the Enum key. SetupDiOpenDevRegKey does not
+    // open that key for this device.
+    let name = wide(&parameters_key(instance));
     let mut params = 0isize;
-    let sub = wide("Device Parameters");
-    let status = unsafe { RegOpenKeyExW(hw.0, sub.as_ptr(), 0, KEY_READ, &mut params) };
+    let status =
+        unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, name.as_ptr(), 0, KEY_READ, &mut params) };
     if status != 0 {
         return Err(format!(
             "interface 1 has no WinUSB device interface ({status})"
@@ -677,8 +749,7 @@ fn interrupt_pipe(usb: &WinUsb) -> Result<Pipe, String> {
     first_interrupt_in(&pipes).ok_or_else(|| "interface 1 has no interrupt in pipe".to_string())
 }
 
-fn set_timeout(usb: &WinUsb, pipe: u8) -> Result<(), String> {
-    let timeout = 200u32;
+fn set_timeout(usb: &WinUsb, pipe: u8, timeout: u32) -> Result<(), String> {
     let ok = unsafe {
         WinUsb_SetPipePolicy(
             usb.0,
@@ -695,6 +766,78 @@ fn set_timeout(usb: &WinUsb, pipe: u8) -> Result<(), String> {
     }
 }
 
+fn same_stroke(left: &Stroke, right: &Stroke) -> bool {
+    left.kind == right.kind && left.code == right.code && left.extended == right.extended
+}
+
+fn typematic_action(action: Action) -> bool {
+    matches!(
+        action,
+        Action::Key(_) | Action::VolumeDown | Action::VolumeUp
+    )
+}
+
+fn typematic_from_spi(delay_index: u32, speed: u32) -> Typematic {
+    // Delay indexes 0..3 are 250..1000 ms. Speed 0..31 is about 2.5..30 Hz.
+    let delay_index = delay_index.min(3);
+    let speed = u64::from(speed.min(31));
+    let per_second_milli = 2500 + speed * 27500 / 31;
+    Typematic {
+        delay_ms: 250 * u64::from(delay_index + 1),
+        interval_ms: (1_000_000 / per_second_milli).max(1),
+    }
+}
+
+fn system_typematic() -> Typematic {
+    let mut speed = 31u32;
+    let mut delay = 1u32;
+    unsafe {
+        if SystemParametersInfoW(
+            SPI_GETKEYBOARDSPEED,
+            0,
+            &mut speed as *mut u32 as *mut u8,
+            0,
+        ) == 0
+        {
+            speed = 31;
+        }
+        if SystemParametersInfoW(
+            SPI_GETKEYBOARDDELAY,
+            0,
+            &mut delay as *mut u32 as *mut u8,
+            0,
+        ) == 0
+        {
+            delay = 1;
+        }
+    }
+    typematic_from_spi(delay, speed)
+}
+
+fn repeats_due(elapsed_ms: u64, rate: Typematic, sent: u32) -> u32 {
+    if rate.interval_ms == 0 || elapsed_ms < rate.delay_ms {
+        return 0;
+    }
+    let past = elapsed_ms - rate.delay_ms;
+    let should = 1 + past / rate.interval_ms;
+    let should = u32::try_from(should).unwrap_or(u32::MAX);
+    should.saturating_sub(sent)
+}
+
+fn advance_repeat(elapsed_ms: u64, sent: u32, rate: Typematic) -> Option<u32> {
+    let due = repeats_due(elapsed_ms, rate, sent);
+    if due == 0 {
+        None
+    } else {
+        sent.checked_add(due)
+    }
+}
+
+fn device_open_flags() -> u32 {
+    // WinUsb_Initialize returns error 6 unless CreateFile requested overlapped I/O.
+    FILE_FLAG_OVERLAPPED
+}
+
 fn open_device(path: &str) -> Result<Handle, String> {
     let wide_path = wide(path);
     let handle = unsafe {
@@ -704,7 +847,7 @@ fn open_device(path: &str) -> Result<Handle, String> {
             FILE_SHARE_READ_WRITE,
             std::ptr::null(),
             OPEN_EXISTING,
-            0,
+            device_open_flags(),
             0,
         )
     };
@@ -910,14 +1053,6 @@ extern "system" {
         size: u32,
         required: *mut u32,
     ) -> i32;
-    fn SetupDiOpenDevRegKey(
-        set: isize,
-        data: *mut DevInfoData,
-        scope: u32,
-        profile: u32,
-        key_type: u32,
-        sam: u32,
-    ) -> isize;
     fn SetupDiEnumDeviceInterfaces(
         set: isize,
         device: *const u8,
@@ -984,6 +1119,7 @@ extern "system" {
 #[link(name = "user32")]
 extern "system" {
     fn SendInput(count: u32, inputs: *const Input, size: i32) -> u32;
+    fn SystemParametersInfoW(action: u32, param: u32, value: *mut u8, winini: u32) -> i32;
 }
 
 #[cfg(test)]
@@ -1095,6 +1231,19 @@ mod tests {
     }
 
     #[test]
+    fn winusb_open_requests_overlapped_io() {
+        assert_eq!(device_open_flags(), 0x4000_0000);
+    }
+
+    #[test]
+    fn parameters_live_on_the_enum_key() {
+        assert_eq!(
+            parameters_key(r"USB\VID_05AC&PID_0321&MI_01\INSTANCE"),
+            r"SYSTEM\CurrentControlSet\Enum\USB\VID_05AC&PID_0321&MI_01\INSTANCE\Device Parameters"
+        );
+    }
+
+    #[test]
     fn parses_a_device_interface_guid() {
         let guid = parse_guid("{A5DCBF10-6530-11D2-901F-00C04FB951ED}").unwrap();
         assert_eq!(guid.data1, 0xA5DC_BF10);
@@ -1102,6 +1251,46 @@ mod tests {
         assert_eq!(guid.data3, 0x11D2);
         assert_eq!(guid.data4, [0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED]);
         assert!(parse_guid("not-a-guid").is_none());
+    }
+
+    #[test]
+    fn held_key_repeats_after_the_typematic_delay() {
+        let rate = typematic_from_spi(1, 31);
+        assert_eq!(rate.delay_ms, 500);
+        assert_eq!(rate.interval_ms, 33);
+        assert_eq!(advance_repeat(499, 0, rate), None);
+        assert_eq!(advance_repeat(500, 0, rate), Some(1));
+        assert_eq!(advance_repeat(500, 1, rate), None);
+        assert_eq!(advance_repeat(532, 1, rate), None);
+        assert_eq!(advance_repeat(533, 1, rate), Some(2));
+        let stalled = advance_repeat(5_000, 0, rate).unwrap();
+        assert!(stalled > 1);
+        assert_eq!(advance_repeat(5_000, stalled, rate), None);
+    }
+
+    #[test]
+    fn typematic_endpoints_match_windows() {
+        assert_eq!(typematic_from_spi(0, 0).delay_ms, 250);
+        assert_eq!(typematic_from_spi(0, 0).interval_ms, 400);
+        assert_eq!(typematic_from_spi(3, 31).delay_ms, 1000);
+        assert_eq!(typematic_from_spi(3, 31).interval_ms, 33);
+        assert_eq!(typematic_from_spi(9, 100).delay_ms, 1000);
+        assert_eq!(typematic_from_spi(9, 100).interval_ms, 33);
+    }
+
+    #[test]
+    fn letters_repeat_and_toggles_do_not() {
+        assert!(typematic_action(Action::Key(0x2A)));
+        assert!(typematic_action(Action::VolumeDown));
+        assert!(typematic_action(Action::VolumeUp));
+        assert!(!typematic_action(Action::Sleep));
+        assert!(!typematic_action(Action::Mute));
+        assert!(!typematic_action(Action::NumLock));
+        assert!(!typematic_action(Action::Search));
+        assert!(!typematic_action(Action::PlayPause));
+        assert!(!typematic_action(Action::TrackNext));
+        assert!(!typematic_action(Action::TrackPrevious));
+        assert!(!typematic_action(Action::Function));
     }
 
     #[test]
