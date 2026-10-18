@@ -1,0 +1,14 @@
+[package]
+name = "magickeyboard"
+version = "0.1.0"
+edition = "2021"
+description = "Open source driver for Apple Magic Keyboard HID reports"
+publish = false
+
+[lib]
+name = "magickeyboard"
+path = "src/lib.rs"
+
+[[bin]]
+name = "magickeyboard"
+path = "src/main.rs"
