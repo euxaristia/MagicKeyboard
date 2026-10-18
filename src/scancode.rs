@@ -117,6 +117,18 @@ pub fn usage_from_scan(make: u16, extended: bool) -> Option<u16> {
     }
 }
 
+/// Inverse of [`usage_from_scan`]. `(make, extended)`.
+pub(crate) fn scan_from_usage(usage: u16) -> Option<(u16, bool)> {
+    for extended in [false, true] {
+        for make in 0..0x100u16 {
+            if usage_from_scan(make, extended) == Some(usage) {
+                return Some((make, extended));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +143,24 @@ mod tests {
             "scan 0321 down left cmd"
         );
         assert_eq!(format_scan(0x0321, 0x63, 0), "scan 0321 down make 0063");
+    }
+
+    #[test]
+    fn every_named_scan_round_trips() {
+        for extended in [false, true] {
+            for make in 0..0x100u16 {
+                let Some(usage) = usage_from_scan(make, extended) else {
+                    continue;
+                };
+                assert_eq!(
+                    scan_from_usage(usage),
+                    Some((make, extended)),
+                    "make {make:04x} extended {extended}"
+                );
+            }
+        }
+        assert_eq!(scan_from_usage(0x04), Some((0x1E, false)));
+        assert_eq!(scan_from_usage(0x50), Some((0x4B, true)));
+        assert_eq!(scan_from_usage(0x64), None);
     }
 }

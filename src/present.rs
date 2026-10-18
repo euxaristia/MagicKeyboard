@@ -1,7 +1,7 @@
 use crate::model::{identify, measured_interfaces, MapKind};
 use crate::names::{consumer_name, label};
 use crate::report::InputReport;
-use crate::session::{Action, Options, Session};
+use crate::session::{Action, Edge, Options, Session};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionView {
@@ -107,6 +107,23 @@ pub fn edge_line(action: &Action, down: bool) -> String {
     format!("{dir} {}", label(action))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Step {
+    Edge(Edge),
+    /// Consumer usage that is not one of the named actions.
+    Consumer(u16, bool),
+}
+
+pub(crate) fn step_line(step: &Step) -> String {
+    match step {
+        Step::Edge(edge) => edge_line(&edge.action, edge.down),
+        Step::Consumer(usage, down) => {
+            let dir = if *down { "down" } else { "up" };
+            format!("{dir} {}", consumer_name(*usage))
+        }
+    }
+}
+
 /// Keyboard, consumer, and system reports in one place. Keyboard reports go
 /// through the Fn map. Consumer and system reports become down and up edges.
 pub struct Translator {
@@ -125,40 +142,70 @@ impl Translator {
     }
 
     pub fn push(&mut self, report: &InputReport) -> Vec<String> {
+        self.steps(report).iter().map(step_line).collect()
+    }
+
+    pub(crate) fn steps(&mut self, report: &InputReport) -> Vec<Step> {
         match report {
             InputReport::Keyboard(report) => self
                 .session
                 .push_keyboard(report)
-                .iter()
-                .map(|edge| edge_line(&edge.action, edge.down))
+                .into_iter()
+                .map(Step::Edge)
                 .collect(),
             InputReport::Consumer(report) => self.push_consumer(report.usage),
             InputReport::System(report) => self.push_sleep(report.sleep),
         }
     }
 
-    fn push_consumer(&mut self, usage: u16) -> Vec<String> {
+    fn push_consumer(&mut self, usage: u16) -> Vec<Step> {
         if usage == self.consumer {
             return Vec::new();
         }
-        let mut lines = Vec::new();
+        let mut steps = Vec::new();
         if self.consumer != 0 {
-            lines.push(format!("up {}", consumer_name(self.consumer)));
+            steps.push(consumer_step(self.consumer, false));
         }
         self.consumer = usage;
         if usage != 0 {
-            lines.push(format!("down {}", consumer_name(usage)));
+            steps.push(consumer_step(usage, true));
         }
-        lines
+        steps
     }
 
-    fn push_sleep(&mut self, sleep: bool) -> Vec<String> {
+    fn push_sleep(&mut self, sleep: bool) -> Vec<Step> {
         if sleep == self.sleep {
             return Vec::new();
         }
         self.sleep = sleep;
-        vec![edge_line(&Action::Sleep, sleep)]
+        vec![Step::Edge(Edge {
+            action: Action::Sleep,
+            down: sleep,
+        })]
     }
+}
+
+fn consumer_step(usage: u16, down: bool) -> Step {
+    match consumer_action(usage) {
+        Some(action) => Step::Edge(Edge { action, down }),
+        None => Step::Consumer(usage, down),
+    }
+}
+
+fn consumer_action(usage: u16) -> Option<Action> {
+    Some(match usage {
+        0x006F => Action::BrightnessUp,
+        0x0070 => Action::BrightnessDown,
+        0x00B5 => Action::TrackNext,
+        0x00B6 => Action::TrackPrevious,
+        0x00B8 => Action::Eject,
+        0x00CD => Action::PlayPause,
+        0x00E2 => Action::Mute,
+        0x00E9 => Action::VolumeUp,
+        0x00EA => Action::VolumeDown,
+        0x0221 => Action::Search,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -223,6 +270,27 @@ mod tests {
         assert_eq!(
             translator.push(&InputReport::System(sleep)),
             vec!["down sleep".to_string()]
+        );
+        let odd = parse_consumer(&[0x03, 0x34, 0x12]).unwrap();
+        assert_eq!(
+            translator.push(&InputReport::Consumer(odd)),
+            vec!["down consumer 1234".to_string()]
+        );
+    }
+
+    #[test]
+    fn volume_is_an_action_edge() {
+        use crate::report::parse_consumer;
+        use crate::session::{Action, Edge};
+
+        let mut translator = Translator::new(MapKind::Magic2021, true, Options::default());
+        let volume = parse_consumer(&[0x03, 0xE9, 0x00]).unwrap();
+        assert_eq!(
+            translator.steps(&InputReport::Consumer(volume)),
+            vec![Step::Edge(Edge {
+                action: Action::VolumeUp,
+                down: true,
+            })]
         );
     }
 }

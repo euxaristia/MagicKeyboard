@@ -37,6 +37,13 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Ok(Command::Drive(options)) => match magickeyboard::drive(&options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("{message}");
+                ExitCode::from(1)
+            }
+        },
     }
 }
 
@@ -54,6 +61,7 @@ enum Command {
     Status,
     Listen(Options),
     Raw(RawArgs),
+    Drive(Options),
     Help,
 }
 
@@ -67,10 +75,12 @@ const HELP: &str = "\
 magickeyboard status
 magickeyboard listen [--fn-mode MODE] [--swap-opt-cmd [both|left]] [--swap-ctrl-cmd] [--swap-fn-leftctrl] [--iso | --no-iso]
 magickeyboard raw [--list] [--seconds N]
+magickeyboard drive [--fn-mode MODE] [--swap-opt-cmd [both|left]] [--swap-ctrl-cmd] [--swap-fn-leftctrl] [--iso | --no-iso]
 
 status   print the connected Magic Keyboard and the idle report
 listen   translate HID reports, and name inbox scan codes, until Ctrl+C
 raw      same translation for Raw Input HID reports; scan codes are named only
+drive    read interface 1 from WinUSB and inject translated keys until Ctrl+C
 --list   print the Apple devices Raw Input can see, then exit
 --seconds N
          stop raw after N seconds; 0 registers and exits
@@ -87,6 +97,8 @@ raw      same translation for Raw Input HID reports; scan codes are named only
 --swap-fn-leftctrl            swap Fn and left Control
 --iso                         swap ` and the non-US key
 --no-iso                      keep ` and the non-US key
+
+drive fails until interface 1 is bound to WinUSB, and does not install that binding.
 ";
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
@@ -107,6 +119,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
                     options: Options::default(),
                 }),
             )?,
+            "drive" => set_command(&mut command, Command::Drive(Options::default()))?,
             "--list" => raw_list = true,
             "--seconds" => {
                 let value = args
@@ -145,24 +158,25 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
             other => return Err(format!("unknown argument {other}\n{HELP}")),
         }
     }
-    if matches!(command, Some(Command::Listen(_))) {
-        command = Some(Command::Listen(options));
+    if (raw_list || raw_seconds.is_some()) && !matches!(command, Some(Command::Raw(_))) {
+        return Err(format!("--list and --seconds belong to raw\n{HELP}"));
     }
-    if matches!(command, Some(Command::Raw(_))) {
-        command = Some(Command::Raw(RawArgs {
+    command = match command {
+        Some(Command::Listen(_)) => Some(Command::Listen(options)),
+        Some(Command::Drive(_)) => Some(Command::Drive(options)),
+        Some(Command::Raw(_)) => Some(Command::Raw(RawArgs {
             list: raw_list,
             seconds: raw_seconds,
             options,
-        }));
-    } else if raw_list || raw_seconds.is_some() {
-        return Err(format!("--list and --seconds belong to raw\n{HELP}"));
-    }
+        })),
+        other => other,
+    };
     Ok(command.unwrap_or(Command::Status))
 }
 
 fn set_command(slot: &mut Option<Command>, command: Command) -> Result<(), String> {
     if slot.is_some() {
-        return Err("pass one of status, listen, or raw".to_string());
+        return Err("pass one of status, listen, raw, or drive".to_string());
     }
     *slot = Some(command);
     Ok(())
@@ -230,5 +244,19 @@ mod tests {
         };
         assert!(raw.list);
         assert_eq!(raw.seconds, Some(0));
+    }
+
+    #[test]
+    fn drive_takes_the_listen_flags() {
+        let Command::Drive(options) = parse_args(
+            ["drive", "--fn-mode", "fkeysfirst", "--swap-ctrl-cmd"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap() else {
+            panic!("drive");
+        };
+        assert_eq!(options.fn_mode, FnMode::FkeysFirst);
+        assert!(options.swap_ctrl_cmd);
     }
 }

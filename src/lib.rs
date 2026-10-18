@@ -1,4 +1,5 @@
 mod descriptor;
+mod inject;
 mod model;
 mod names;
 mod present;
@@ -17,8 +18,12 @@ pub use session::{Action, Edge, FnMode, Iso, Options, Session, SwapOptCmd};
 mod rawinput;
 #[cfg(windows)]
 mod winhid;
+#[cfg(windows)]
+mod winusb;
 
 #[cfg(windows)]
 pub use rawinput::{listen_raw, raw_status};
 #[cfg(windows)]
 pub use winhid::{listen, status};
+#[cfg(windows)]
+pub use winusb::drive;
